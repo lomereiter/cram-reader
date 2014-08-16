@@ -1,0 +1,3 @@
+[submodule "biod"]
+	path = biod
+	url = https://github.com/BioD/biod.git
