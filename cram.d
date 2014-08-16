@@ -436,7 +436,35 @@ struct BitStream {
     }
 }
 
+struct TagDefinition {
+    private char[2] _name;
+    char type;
+
+    this(string name, char type) {
+        _name[0] = name[0];
+        _name[1] = name[1];
+        this.type = type;
+    }
+
+    string name() @property const {
+        return cast(string)_name[];
+    }
+}
+
 struct CompressionHeader {
+    static struct TagDefinitionRange {
+        string s;
+        this(string s) {
+            this.s = s;
+        }
+
+        bool empty() @property const { return s.length == 0; }
+        TagDefinition front() @property const {
+            return TagDefinition(s[0 .. 2], s[2]);
+        }
+        void popFront() { s = s[3 .. $]; }
+    }
+
     private {
         static struct PreservationMap {
             ubyte rn;
@@ -444,6 +472,7 @@ struct CompressionHeader {
             ubyte rr;
             ubyte[5] sm;
             ubyte[] td;
+            size_t[] starts;
         }
 
         static struct SubstitutionMatrix {
@@ -474,6 +503,11 @@ struct CompressionHeader {
                     if (!read(stream,  &len)) return false;
                     _pm.td.length = len;
                     if (!read(stream, _pm.td)) return false;
+                    _pm.starts ~= 0;
+                    foreach (size_t j, char c; _pm.td) {
+                        if (c == '\0')
+                            _pm.starts ~= j + 1;
+                    }
                     break;
                 }
                 default: assert(0);
@@ -503,6 +537,12 @@ struct CompressionHeader {
     bool AP_is_delta_encoded() @property const { return !!_pm.ap; }
     bool reference_required() @property const { return !!_pm.rr; }
     Encoding encoding(string key) const { return _encodings[key]; }
+
+    auto tags(size_t id) const {
+        auto start = _pm.starts[id];
+        auto stop = _pm.starts[id + 1] - 1;
+        return TagDefinitionRange(cast(string)_pm.td[start .. stop]);
+    }
     
     this(CramBlock block) {
         const(ubyte)[] data = block.uncompressed_data;
@@ -731,6 +771,13 @@ struct CompressionBitFlags {
     bool has_mate_downstream()       @property const { return cast(bool)(flags & 4); }
 }
 
+struct MateFlags {
+    ubyte flags;
+    this(itf8 flags) { this.flags = cast(ubyte)flags.value; }
+    bool is_reverse_strand() @property const { return cast(bool)(flags & 1); }
+    bool is_mapped()         @property const { return cast(bool)(flags & 2); }
+}
+
 import std.range, std.algorithm;
 
 void main(string[] args) {
@@ -772,24 +819,44 @@ void main(string[] args) {
 
         if (container.n_records > 0) {
             auto bit_stream = BitStream(core_data, external_blocks);
+            for (size_t i = 0; i < min(1, container.n_records); ++i) {
             auto bit_flags = CramBitFlags(bit_stream.read(compression.encoding("BF")));
             auto compression_flags = CompressionBitFlags(bit_stream.read(compression.encoding("CF")));
             int ref_id = bit_stream.read(compression.encoding("RI"));
             int read_length = bit_stream.read(compression.encoding("RL"));
 
-            // this may be delta
-            int alignment_start = bit_stream.read(compression.encoding("AP"));
+            // compression.AP_is_delta_encoded?
+            int position = bit_stream.read(compression.encoding("AP"));
 
             int read_group = bit_stream.read(compression.encoding("RG"));
 
-            writeln(read_group);
-            writeln(alignment_start + container.start_pos);
-
-            auto read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
-            writeln(read_name);
+            string read_name;
+            if (compression.read_names_included)
+                read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
+            writeln("Read: ", read_name);
+            writeln("  Position: ", position + container.start_pos);
+            writeln("  Read group id: ", read_group);
 
             if (compression_flags.detached) {
+                auto mate_flags = MateFlags(bit_stream.read(compression.encoding("MF")));
+                string mate_read_name;
+                if (compression.read_names_included)
+                    mate_read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
+                int mate_ref_id = bit_stream.read(compression.encoding("NS"));
+                int mate_position = bit_stream.read(compression.encoding("NP"));
+                int template_size = bit_stream.read(compression.encoding("TS"));
+                writeln("Mate: ", mate_read_name);
+                writeln("  Ref. id: ", mate_ref_id);
+                writeln("  Position: ", mate_position);
+                writeln("  Template size: ", template_size);
+            } else if (compression_flags.has_mate_downstream) {
+                int records_to_next_fragment = bit_stream.read(compression.encoding("NF"));
+                writeln("Records to next fragment: ", records_to_next_fragment);
             }
+
+            int taglist_id = bit_stream.read(compression.encoding("TL"));
+            writeln("Tags: ", compression.tags(taglist_id));
+        }
         }
     }
 }
