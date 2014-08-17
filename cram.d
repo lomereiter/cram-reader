@@ -1,6 +1,6 @@
 import std.stdio, std.stream, std.bitmanip, std.traits, std.exception, std.conv,
     std.algorithm, std.array, std.string, std.zlib;
-import bio.sam.header;
+import bio.sam.header, bio.bam.tagvalue;
 
 bool seekCur(ref const(ubyte)[] stream, size_t n) {
     if (stream.length < n)
@@ -449,6 +449,15 @@ struct TagDefinition {
     string name() @property const {
         return cast(string)_name[];
     }
+
+    int id() @property const {
+        int result = _name[0];
+        result <<= 8;
+        result |= _name[1];
+        result <<= 8;
+        result |= type;
+        return result;
+    }
 }
 
 struct CompressionHeader {
@@ -483,6 +492,7 @@ struct CompressionHeader {
         PreservationMap _pm;
 
         Encoding[string] _encodings;
+        Encoding[int] _tag_encodings;
 
         // TODO: can we assume fixed order here?
         bool readPreservationMap(S)(auto ref S stream) {
@@ -531,12 +541,31 @@ struct CompressionHeader {
             }
             return true;
         }
+
+        bool readTagEncodings(S)(auto ref S stream) {
+            itf8 size_in_bytes = void;
+            itf8 n_elements = void;
+            if (!read(stream, &size_in_bytes) ||
+                !read(stream, &n_elements)) return false;
+            itf8 key = void;
+            Encoding encoding = void;
+            foreach (k; 0 .. n_elements) {
+                if (!read(stream, &key)) return false;
+                if (!read(stream, &encoding)) return false;
+                _tag_encodings[key] = encoding;
+            }
+            return true;
+        }
     }
 
     bool read_names_included() @property const { return !!_pm.rn; }
     bool AP_is_delta_encoded() @property const { return !!_pm.ap; }
     bool reference_required() @property const { return !!_pm.rr; }
     Encoding encoding(string key) const { return _encodings[key]; }
+
+    Encoding tagEncoding(TagDefinition tag_definition) const {
+        return _tag_encodings[tag_definition.id];
+    }
 
     auto tags(size_t id) const {
         auto start = _pm.starts[id];
@@ -548,6 +577,7 @@ struct CompressionHeader {
         const(ubyte)[] data = block.uncompressed_data;
         bool ok = readPreservationMap(data); assert(ok);
         ok = readDataSeriesEncodings(data); assert(ok);
+        ok = readTagEncodings(data); assert(ok);
     }
 }
 
@@ -856,6 +886,12 @@ void main(string[] args) {
 
             int taglist_id = bit_stream.read(compression.encoding("TL"));
             writeln("Tags: ", compression.tags(taglist_id));
+            foreach (tag; compression.tags(taglist_id)) {
+                auto bytes = bit_stream.readArray(compression.tagEncoding(tag));
+                size_t offset = 0;
+                auto value = bio.bam.tagvalue.readValueFromArray(tag.type, bytes, offset);
+                writeln("[", tag.name, "] = ", value);
+            }
         }
         }
     }
