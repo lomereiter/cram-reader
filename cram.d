@@ -370,6 +370,7 @@ struct BitStream {
     private {
         const(ubyte)[] _data;
         ubyte _curr_byte_read_bits;
+        size_t _read_bytes;
         CramBlock[] _external_blocks;
         size_t[] _read_bytes_from_external;
     }
@@ -377,6 +378,7 @@ struct BitStream {
     this(const(ubyte)[] data, CramBlock[] external_blocks) {
         _data = data;
         _curr_byte_read_bits = 0;
+        _read_bytes = 0;
         _read_bytes_from_external.length = external_blocks.length;
         _external_blocks = external_blocks;
     }
@@ -396,15 +398,37 @@ struct BitStream {
         if (_curr_byte_read_bits == 8) {
             _data = _data[1 .. $];
             _curr_byte_read_bits = 0;
+            ++_read_bytes;
         }
+    }
+
+    size_t bits_consumed() @property const {
+        return _curr_byte_read_bits + _read_bytes * 8;
     }
 
     itf8 read(Encoding encoding) {
         switch (encoding.type) {
+            case EncodingType.none:
+                const(ubyte)[] bytes = _data[];
+                itf8 result;
+                .read(bytes, &result);
+                _read_bytes += bytes.ptr - _data.ptr;
+                _curr_byte_read_bits = 0;
+                return result;
             case EncodingType.huffmanInt:
                 return encoding.huffman.read(this);
             case EncodingType.gamma:
                 return encoding.gamma.read(this);
+            case EncodingType.external:
+                auto id = encoding.external.id;
+                auto bytes_read = _read_bytes_from_external[id];
+                auto data = _external_blocks[id].uncompressed_data[bytes_read .. $];
+                auto bitstream = BitStream(data, []);
+                auto integer = bitstream.read(Encoding(EncodingType.none));
+                auto n_bits = bitstream.bits_consumed;
+                assert(n_bits % 8 == 0);
+                _read_bytes_from_external[id] += n_bits / 8;
+                return integer;
             default:
                 stderr.writeln("TODO: implement ", encoding.type);
                 return itf8.init;
@@ -429,6 +453,16 @@ struct BitStream {
             case EncodingType.byteArrayLen:
                 auto length = this.read(*(encoding.byte_array_len.len_encoding));
                 return this.readArray(*(encoding.byte_array_len.val_encoding), length);
+            case EncodingType.byteArrayStop:
+                auto delim = encoding.byte_array_stop.delim;
+                auto id = encoding.byte_array_stop.external_id;
+                auto bytes_read = _read_bytes_from_external[id];
+                auto start = bytes_read;
+                while (_external_blocks[id].uncompressed_data[bytes_read] != delim)
+                    ++bytes_read;
+                auto result = _external_blocks[id].uncompressed_data[start .. bytes_read];
+                _read_bytes_from_external[id] = bytes_read + 1;
+                return result;
             default:
                 stderr.writeln("TODO: implement ", encoding.type);
                 return [];
@@ -808,6 +842,123 @@ struct MateFlags {
     bool is_mapped()         @property const { return cast(bool)(flags & 2); }
 }
 
+struct ReadFeature {
+    static enum Type : char {
+        readBase = 'B',
+        substitution = 'X',
+        insertion = 'I',
+        deletion = 'D',
+        insertBase = 'i',
+        qualityScore = 'Q',
+        referenceSkip = 'N',
+        softClip = 'S',
+        padding = 'P',
+        hardClip = 'H'
+    }
+
+    private {
+        static string fields(specs...)() {
+            char[] result;
+            foreach (spec; specs)
+                result ~= spec.Type.stringof ~ " " ~ spec.Name ~ ";";
+            return cast(string)result;
+        }
+
+        static string reader(specs...)() {
+            string result = "void read(ref BitStream bitstream, "
+                            "ref CompressionHeader compression) {";
+            foreach (spec; specs) {
+                result ~= spec.Name~`=cast(`~spec.Type.stringof ~`)`;
+                if (isIntegral!(spec.Type) || is(spec.Type == char))
+                    result ~= `bitstream.read(compression.encoding("`~spec.Code~`"));`;
+                else
+                    result ~= `bitstream.readArray(compression.encoding("`~spec.Code~`"));`;
+            }
+            result ~= "}";
+            return result;
+        }
+    }
+
+    static struct F(string code, string name, T) {
+        enum Code = code;
+        enum Name = name;
+        alias T Type;
+    }
+
+    static struct ReadFeatureImpl(specs...) {
+        mixin(fields!specs());
+        mixin(reader!specs());
+    }
+
+    alias ReadFeatureImpl!(F!("BA", "base", char), F!("QS", "quality", byte)) ReadBase;
+    alias ReadFeatureImpl!(F!("BS", "code", byte)) Substitution;
+    alias ReadFeatureImpl!(F!("IN", "bases", ubyte[])) Insertion;
+    alias ReadFeatureImpl!(F!("DL", "length", int)) Deletion;
+    alias ReadFeatureImpl!(F!("BA", "base", char)) InsertBase;
+    alias ReadFeatureImpl!(F!("QS", "quality", byte)) QualityScore;
+    alias ReadFeatureImpl!(F!("RS", "length", int)) ReferenceSkip;
+    alias ReadFeatureImpl!(F!("SC", "bases", string)) SoftClip;
+    alias ReadFeatureImpl!(F!("PD", "length", int)) Padding;
+    alias ReadFeatureImpl!(F!("HC", "length", int)) HardClip;
+
+    int position;
+    Type type;
+    union {
+        ReadBase read_base;
+        Substitution subst;
+        Insertion insertion;
+        Deletion deletion;
+        InsertBase insert_base;
+        QualityScore qual_score;
+        ReferenceSkip ref_skip;
+        SoftClip soft_clip;
+        Padding padding;
+        HardClip hard_clip;
+    }
+
+    string toString() {
+        string result = "ReadFeature(position = " ~ position.to!string() ~ 
+                        ", type = " ~ type.to!string ~ " -- ";
+        final switch (type) {
+            case Type.readBase:      result ~= read_base.to!string();   break;
+            case Type.substitution:  result ~= subst.to!string();       break;
+            case Type.insertion:     result ~= read_base.to!string();   break;
+            case Type.deletion:      result ~= deletion.to!string();    break;
+            case Type.softClip:      result ~= soft_clip.to!string();   break;
+            case Type.hardClip:      result ~= hard_clip.to!string();   break;
+            case Type.padding:       result ~= padding.to!string();     break;
+            case Type.insertBase:    result ~= insert_base.to!string(); break;
+            case Type.qualityScore:  result ~= qual_score.to!string();  break;
+            case Type.referenceSkip: result ~= ref_skip.to!string();    break;
+        }
+        result ~= ")";
+        return result;
+    }
+
+    static ReadFeature readFromBitStream(ref BitStream bitstream, 
+                                         ref CompressionHeader compression,
+                                         ref int prev_pos)
+    {
+        ReadFeature feature;
+        feature.type = cast(Type)(bitstream.read(compression.encoding("FC")));
+        feature.position = bitstream.read(compression.encoding("FP")) + prev_pos;
+        prev_pos = feature.position;
+        final switch (feature.type) {
+            case Type.readBase:      feature.read_base.read(bitstream, compression);   break;
+            case Type.substitution:  feature.subst.read(bitstream, compression);       break;
+            case Type.insertion:     feature.read_base.read(bitstream, compression);   break;
+            case Type.deletion:      feature.deletion.read(bitstream, compression);    break;
+            case Type.softClip:      feature.soft_clip.read(bitstream, compression);   break;
+            case Type.hardClip:      feature.hard_clip.read(bitstream, compression);   break;
+            case Type.padding:       feature.padding.read(bitstream, compression);     break;
+            case Type.insertBase:    feature.insert_base.read(bitstream, compression); break;
+            case Type.qualityScore:  feature.qual_score.read(bitstream, compression);  break;
+            case Type.referenceSkip: feature.ref_skip.read(bitstream, compression);    break;
+        }
+        return feature;
+    }
+}
+
 import std.range, std.algorithm;
 
 void main(string[] args) {
@@ -849,14 +1000,19 @@ void main(string[] args) {
 
         if (container.n_records > 0) {
             auto bit_stream = BitStream(core_data, external_blocks);
-            for (size_t i = 0; i < min(1, container.n_records); ++i) {
+            int prev_pos = int.min;
+            for (size_t i = 0; i < min(10, container.n_records); ++i) {
             auto bit_flags = CramBitFlags(bit_stream.read(compression.encoding("BF")));
             auto compression_flags = CompressionBitFlags(bit_stream.read(compression.encoding("CF")));
             int ref_id = bit_stream.read(compression.encoding("RI"));
             int read_length = bit_stream.read(compression.encoding("RL"));
 
-            // compression.AP_is_delta_encoded?
-            int position = bit_stream.read(compression.encoding("AP"));
+            int position;
+            if (prev_pos == int.min || !compression.AP_is_delta_encoded)
+                position = bit_stream.read(compression.encoding("AP"));
+            else
+                position = prev_pos + bit_stream.read(compression.encoding("AP"));
+            prev_pos = position;
 
             int read_group = bit_stream.read(compression.encoding("RG"));
 
@@ -891,6 +1047,30 @@ void main(string[] args) {
                 size_t offset = 0;
                 auto value = bio.bam.tagvalue.readValueFromArray(tag.type, bytes, offset);
                 writeln("[", tag.name, "] = ", value);
+            }
+
+            if (!bit_flags.is_unmapped) {
+                int n_read_features = bit_stream.read(compression.encoding("FN"));
+                writeln("  ", n_read_features, " read features");
+                int feature_prev_pos = 0;
+                foreach (k; 0 .. n_read_features) {
+                    auto feature = ReadFeature.readFromBitStream(bit_stream, compression,
+                                                                 feature_prev_pos);
+                    writeln("    ", feature);
+                }
+                auto mapping_quality = bit_stream.read(compression.encoding("MQ"));
+                writeln("  Mapping quality = ", mapping_quality);
+            } else {
+                auto bases = new char[read_length];
+                auto base_encoding = compression.encoding("BA");
+                foreach (k; 0 .. read_length)
+                    bases[k] = cast(char)(bit_stream.read(base_encoding));
+            }
+
+            if (compression_flags.qualities_stored_as_array) {
+                auto qualities = bit_stream.readArray(compression.encoding("QS"), 
+                                                      read_length); 
+                writeln(qualities.map!(c=>cast(char)(c+33)));
             }
         }
         }
