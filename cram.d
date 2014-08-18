@@ -183,9 +183,20 @@ struct Encoding {
     EncodingType type;
 
     static struct ExternalParams { itf8 id; }
-    static struct BetaParams { itf8 offset; itf8 length; }
+    static struct BetaParams {
+        itf8 offset; itf8 length;
+        itf8 read(ref BitStream bitstream) {
+            int result;
+            foreach (k; 0 .. length) {
+                result <<= 1;
+                if (bitstream.front) result += 1;
+                bitstream.popFront();
+            }
+            return itf8(result - offset);
+        }
+    }
     static struct GammaParams { 
-        itf8 offset; 
+        itf8 offset;
         itf8 read(ref BitStream bitstream) {
             size_t n;
             int result = 1;
@@ -437,6 +448,8 @@ struct BitStream {
                 return result;
             case EncodingType.huffmanInt:
                 return encoding.huffman.read(this);
+            case EncodingType.beta:
+                return encoding.beta.read(this);
             case EncodingType.gamma:
                 return encoding.gamma.read(this);
             case EncodingType.subExp:
@@ -985,7 +998,9 @@ import std.range, std.algorithm;
 
 void main(string[] args) {
     auto cram = new CramReader(args[1]);
-    foreach (container; cram.containers.take(50)) {
+    size_t records_read;
+    scope(exit) stderr.writeln(records_read);
+    foreach (container; cram.containers) {
         writeln("=== container ===", " (", container.data.length, " bytes, ", container.n_records, " records)");
         CompressionHeader compression;
         MappedSliceHeader slice_header;
@@ -1019,52 +1034,71 @@ void main(string[] args) {
                 core_data = block.uncompressed_data;
             }
         }
-
+        
         if (container.n_records > 0) {
+            auto bf_encoding = compression.encoding("BF");
+            auto cf_encoding = compression.encoding("CF");
+            auto ri_encoding = compression.encoding("RI");
+            auto rl_encoding = compression.encoding("RL");
+            auto ap_encoding = compression.encoding("AP");
+            auto rg_encoding = compression.encoding("RG");
+            auto rn_encoding = compression.encoding("RN");
+            auto mf_encoding = compression.encoding("MF");
+            auto ns_encoding = compression.encoding("NS");
+            auto np_encoding = compression.encoding("NP");
+            auto ts_encoding = compression.encoding("TS");
+            auto nf_encoding = compression.encoding("NF");
+            auto tl_encoding = compression.encoding("TL");
+            auto fn_encoding = compression.encoding("FN");
+            auto mq_encoding = compression.encoding("MQ");
+            auto ba_encoding = compression.encoding("BA");
+            auto qs_encoding = compression.encoding("QS");
+
             auto bit_stream = BitStream(core_data, external_blocks);
             int prev_pos = int.min;
+
             for (size_t i = 0; i < container.n_records; ++i) {
-            auto bit_flags = CramBitFlags(bit_stream.read(compression.encoding("BF")));
-            auto compression_flags = CompressionBitFlags(bit_stream.read(compression.encoding("CF")));
-            int ref_id = bit_stream.read(compression.encoding("RI"));
-            int read_length = bit_stream.read(compression.encoding("RL"));
+            auto bit_flags = CramBitFlags(bit_stream.read(bf_encoding));
+            auto compression_flags = CompressionBitFlags(bit_stream.read(cf_encoding));
+            int ref_id = bit_stream.read(ri_encoding);
+            int read_length = bit_stream.read(rl_encoding);
 
             int position;
             if (prev_pos == int.min || !compression.AP_is_delta_encoded)
-                position = bit_stream.read(compression.encoding("AP"));
+                position = bit_stream.read(ap_encoding);
             else
-                position = prev_pos + bit_stream.read(compression.encoding("AP"));
+                position = prev_pos + bit_stream.read(ap_encoding);
             prev_pos = position;
 
-            int read_group = bit_stream.read(compression.encoding("RG"));
+            int read_group = bit_stream.read(rg_encoding);
 
             string read_name;
             if (compression.read_names_included)
-                read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
+                read_name = cast(string)bit_stream.readArray(rn_encoding);
             writeln("Read: ", read_name);
             writeln("  Position: ", position + container.start_pos);
             writeln("  Read group id: ", read_group);
 
             if (compression_flags.detached) {
-                auto mate_flags = MateFlags(bit_stream.read(compression.encoding("MF")));
+                auto mate_flags = MateFlags(bit_stream.read(mf_encoding));
                 // logic behind this:
                 // even if we don't include read names in general, for detached mates
                 // they still should be present, since this is the way we find the mate later
                 if (!compression.read_names_included)
-                    read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
-                int mate_ref_id = bit_stream.read(compression.encoding("NS"));
-                int mate_position = bit_stream.read(compression.encoding("NP"));
-                int template_size = bit_stream.read(compression.encoding("TS"));
+                    read_name = cast(string)bit_stream.readArray(rn_encoding);
+                int mate_ref_id = bit_stream.read(ns_encoding);
+                int mate_position = bit_stream.read(np_encoding);
+                int template_size = bit_stream.read(ts_encoding);
                 writeln("Mate: ", read_name);
                 writeln("  Ref. id: ", mate_ref_id);
                 writeln("  Position: ", mate_position);
                 writeln("  Template size: ", template_size);
             } else if (compression_flags.has_mate_downstream) {
-                int records_to_next_fragment = bit_stream.read(compression.encoding("NF"));
+                int records_to_next_fragment = bit_stream.read(nf_encoding);
                 writeln("Records to next fragment: ", records_to_next_fragment);
             }
 
-            int taglist_id = bit_stream.read(compression.encoding("TL"));
+            int taglist_id = bit_stream.read(tl_encoding);
             writeln("Tags: ", compression.tags(taglist_id));
             foreach (tag; compression.tags(taglist_id)) {
                 auto bytes = bit_stream.readArray(compression.tagEncoding(tag));
@@ -1074,7 +1108,7 @@ void main(string[] args) {
             }
 
             if (!bit_flags.is_unmapped) {
-                int n_read_features = bit_stream.read(compression.encoding("FN"));
+                int n_read_features = bit_stream.read(fn_encoding);
                 writeln("  ", n_read_features, " read features");
                 int feature_prev_pos = 0;
                 foreach (k; 0 .. n_read_features) {
@@ -1082,20 +1116,20 @@ void main(string[] args) {
                                                                  feature_prev_pos);
                     writeln("    ", feature);
                 }
-                auto mapping_quality = bit_stream.read(compression.encoding("MQ"));
+                auto mapping_quality = bit_stream.read(mq_encoding);
                 writeln("  Mapping quality = ", mapping_quality);
             } else {
                 auto bases = new char[read_length];
-                auto base_encoding = compression.encoding("BA");
                 foreach (k; 0 .. read_length)
-                    bases[k] = cast(char)(bit_stream.read(base_encoding));
+                    bases[k] = cast(char)(bit_stream.read(ba_encoding));
             }
 
             if (compression_flags.qualities_stored_as_array) {
-                auto qualities = bit_stream.readArray(compression.encoding("QS"), 
-                                                      read_length); 
+                auto qualities = bit_stream.readArray(qs_encoding, read_length); 
                 writeln(qualities.map!(c=>cast(char)(c+33)));
             }
+
+            ++records_read;
         }
         }
     }
