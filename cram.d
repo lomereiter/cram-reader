@@ -254,7 +254,7 @@ struct Encoding {
                     code += 1;
                     code <<= (elem[1] - prev_len);
                 }
-                //        writeln("\t", elem[0], " => ", std.string.format("%0*b", elem[1].value, code));
+                //       // writeln("\t", elem[0], " => ", std.string.format("%0*b", elem[1].value, code));
                 root.insert(elem[0], elem[1].value, code);
                 prev_len = elem[1];
             }
@@ -270,7 +270,7 @@ struct Encoding {
                     code += 1;
                     code <<= (elem[1] - prev_len);
                 }
-                writeln("\t", elem[0], " => ", std.string.format("%0*b", elem[1].value, code));
+               // writeln("\t", elem[0], " => ", std.string.format("%0*b", elem[1].value, code));
                 prev_len = elem[1];
             }
         }
@@ -304,7 +304,6 @@ struct Encoding {
         itf8 read(ref BitStream bitstream) {
             auto node = root;
             while (!node.is_leaf) {
-                enforce(!bitstream.empty, "error reading huffman code");
                 auto bit = bitstream.front;
                 bitstream.popFront();
                 node = node.children[bit];
@@ -383,7 +382,7 @@ struct Encoding {
             return .read(stream, &byte_array_stop.delim) &&
                 .read(stream, &byte_array_stop.external_id);
         default:
-            writeln("unknown encoding type, seeking ", n_bytes, " bytes");
+           // writeln("unknown encoding type, seeking ", n_bytes, " bytes");
             return .seekCur(stream, n_bytes);
         }
     }
@@ -508,12 +507,7 @@ struct BitStream {
 struct TagDefinition {
     private char[2] _name;
     char type;
-
-    this(string name, char type) {
-        _name[0] = name[0];
-        _name[1] = name[1];
-        this.type = type;
-    }
+    Encoding encoding;
 
     string name() @property const {
         return cast(string)_name[];
@@ -530,19 +524,6 @@ struct TagDefinition {
 }
 
 struct CompressionHeader {
-    static struct TagDefinitionRange {
-        string s;
-        this(string s) {
-            this.s = s;
-        }
-
-        bool empty() @property const { return s.length == 0; }
-        TagDefinition front() @property const {
-            return TagDefinition(s[0 .. 2], s[2]);
-        }
-        void popFront() { s = s[3 .. $]; }
-    }
-
     private {
         static struct PreservationMap {
             ubyte rn;
@@ -623,6 +604,19 @@ struct CompressionHeader {
                 if (!read(stream, &encoding)) return false;
                 _tag_encodings[key] = encoding;
             }
+            foreach (id; 0 .. _pm.starts.length - 1) {
+                auto start = _pm.starts[id];
+                auto stop = _pm.starts[id + 1] - 1;
+                auto str = cast(string)_pm.td[start .. stop];
+                _tag_definitions ~= new TagDefinition[str.length / 3];
+                foreach (t; 0 .. str.length / 3) {
+                    TagDefinition tag;
+                    tag._name[] = str[t * 3 .. t * 3 + 2];
+                    tag.type = str[t * 3 + 2];
+                    tag.encoding = _tag_encodings[tag.id]; 
+                    _tag_definitions.back[t] = tag;
+                }
+            }
             return true;
         }
     }
@@ -636,10 +630,10 @@ struct CompressionHeader {
         return _tag_encodings[tag_definition.id];
     }
 
-    auto tags(size_t id) const {
-        auto start = _pm.starts[id];
-        auto stop = _pm.starts[id + 1] - 1;
-        return TagDefinitionRange(cast(string)_pm.td[start .. stop]);
+    private TagDefinition[][] _tag_definitions;
+
+    const(TagDefinition)[] tags(size_t id) const {
+        return _tag_definitions[id];
     }
     
     this(CramBlock block) {
@@ -877,6 +871,35 @@ struct MateFlags {
     bool is_mapped()         @property const { return cast(bool)(flags & 2); }
 }
 
+struct EncodingPack(encodings...) {
+    private {
+        static string fields(encodings...)() {
+            string result;
+            foreach (enc; encodings) {
+                result ~= "Encoding "~enc~";";
+            }
+            return result;
+        }
+
+        static string constructor(encodings...)() {
+            string result = "this(ref CompressionHeader compression) {";
+            foreach (enc; encodings) {
+                result ~= enc~`=compression.encoding("`~enc~`");`;
+            }
+            result ~= "}";
+            return result;
+        }
+    }
+    mixin(fields!encodings());
+    mixin(constructor!encodings());
+}
+
+alias EncodingPack!("BA", "QS", "BS", "IN", "DL", "RS", 
+                    "SC", "PD", "HC", "FC", "FP") ReadFeatureEncodingPack;
+
+alias EncodingPack!("BF", "CF", "RI", "RL", "AP", "RG", "RN", "MF", "NS",
+                    "NP", "TS", "NF", "TL", "FN", "MQ", "BA", "QS") CramRecordEncodingPack;
+
 struct ReadFeature {
     static enum Type : char {
         readBase = 'B',
@@ -901,13 +924,13 @@ struct ReadFeature {
 
         static string reader(specs...)() {
             string result = "void read(ref BitStream bitstream, "
-                            "ref CompressionHeader compression) {";
+                            "ref ReadFeatureEncodingPack encodings) {";
             foreach (spec; specs) {
                 result ~= spec.Name~`=cast(`~spec.Type.stringof ~`)`;
                 if (isIntegral!(spec.Type) || is(spec.Type == char))
-                    result ~= `bitstream.read(compression.encoding("`~spec.Code~`"));`;
+                    result ~= `bitstream.read(encodings.`~spec.Code~`);`;
                 else
-                    result ~= `bitstream.readArray(compression.encoding("`~spec.Code~`"));`;
+                    result ~= `bitstream.readArray(encodings.`~spec.Code~`);`;
             }
             result ~= "}";
             return result;
@@ -971,24 +994,24 @@ struct ReadFeature {
     }
 
     static ReadFeature readFromBitStream(ref BitStream bitstream, 
-                                         ref CompressionHeader compression,
+                                         ref ReadFeatureEncodingPack encodings,
                                          ref int prev_pos)
     {
         ReadFeature feature;
-        feature.type = cast(Type)(bitstream.read(compression.encoding("FC")));
-        feature.position = bitstream.read(compression.encoding("FP")) + prev_pos;
+        feature.type = cast(Type)(bitstream.read(encodings.FC));
+        feature.position = bitstream.read(encodings.FC) + prev_pos;
         prev_pos = feature.position;
         final switch (feature.type) {
-            case Type.readBase:      feature.read_base.read(bitstream, compression);   break;
-            case Type.substitution:  feature.subst.read(bitstream, compression);       break;
-            case Type.insertion:     feature.read_base.read(bitstream, compression);   break;
-            case Type.deletion:      feature.deletion.read(bitstream, compression);    break;
-            case Type.softClip:      feature.soft_clip.read(bitstream, compression);   break;
-            case Type.hardClip:      feature.hard_clip.read(bitstream, compression);   break;
-            case Type.padding:       feature.padding.read(bitstream, compression);     break;
-            case Type.insertBase:    feature.insert_base.read(bitstream, compression); break;
-            case Type.qualityScore:  feature.qual_score.read(bitstream, compression);  break;
-            case Type.referenceSkip: feature.ref_skip.read(bitstream, compression);    break;
+            case Type.readBase:      feature.read_base.read(bitstream, encodings);   break;
+            case Type.substitution:  feature.subst.read(bitstream, encodings);       break;
+            case Type.insertion:     feature.read_base.read(bitstream, encodings);   break;
+            case Type.deletion:      feature.deletion.read(bitstream, encodings);    break;
+            case Type.softClip:      feature.soft_clip.read(bitstream, encodings);   break;
+            case Type.hardClip:      feature.hard_clip.read(bitstream, encodings);   break;
+            case Type.padding:       feature.padding.read(bitstream, encodings);     break;
+            case Type.insertBase:    feature.insert_base.read(bitstream, encodings); break;
+            case Type.qualityScore:  feature.qual_score.read(bitstream, encodings);  break;
+            case Type.referenceSkip: feature.ref_skip.read(bitstream, encodings);    break;
         }
         return feature;
     }
@@ -997,11 +1020,19 @@ struct ReadFeature {
 import std.range, std.algorithm;
 
 void main(string[] args) {
+    import std.datetime;
+    StopWatch sw;
+    sw.start();
     auto cram = new CramReader(args[1]);
     size_t records_read;
     scope(exit) stderr.writeln(records_read);
+    int asdf = 1;
     foreach (container; cram.containers) {
-        writeln("=== container ===", " (", container.data.length, " bytes, ", container.n_records, " records)");
+        if (records_read >= 1000000 * asdf) {
+            stderr.writeln(records_read, " records read (avg. speed = ", records_read / (sw.peek().msecs.to!float() * 0.001), " records/sec)");
+            asdf += 1;
+        }
+       // writeln("=== container ===", " (", container.data.length, " bytes, ", container.n_records, " records)");
         CompressionHeader compression;
         MappedSliceHeader slice_header;
         CramBlock[] external_blocks;
@@ -1010,25 +1041,25 @@ void main(string[] args) {
         foreach(block; container.blocks) {
             if (block.content_type == CramBlock.ContentType.compressionHeader) {
                 compression = CompressionHeader(block);
-                writeln("BF: ", compression.encoding("BF"));
+               // writeln("BF: ", compression.encoding("BF"));
                 compression.encoding("BF").huffman.printCodes();
-                writeln("CF: ", compression.encoding("CF"));
+               // writeln("CF: ", compression.encoding("CF"));
                 compression.encoding("CF").huffman.printCodes();
-                writeln("RI: ", compression.encoding("RI"));
+               // writeln("RI: ", compression.encoding("RI"));
                 compression.encoding("RI").huffman.printCodes();
-                writeln("RL: ", compression.encoding("RL"));
+               // writeln("RL: ", compression.encoding("RL"));
                 compression.encoding("RL").huffman.printCodes();
-                writeln("AP: ", compression.encoding("AP"));
-                writeln("RG: ", compression.encoding("RG"));
-                writeln("QS: ", compression.encoding("QS"));
-                writeln("RN: ", compression.encoding("RN"));
+               // writeln("AP: ", compression.encoding("AP"));
+               // writeln("RG: ", compression.encoding("RG"));
+               // writeln("QS: ", compression.encoding("QS"));
+               // writeln("RN: ", compression.encoding("RN"));
             } else if (block.content_type == CramBlock.ContentType.mappedSliceHeader) {
                 slice_header = MappedSliceHeader(block);
             } else if (block.content_type == CramBlock.ContentType.externalData) {
-                writeln("External block #", external_id, ": ", block.compression_method);
+               // writeln("External block #", external_id, ": ", block.compression_method);
                 ++external_id;
-                writeln("Data size: ", block.uncompressed_size);
-                writeln("Data: ", cast(string)block.uncompressed_data[0 .. 80], "...");
+               // writeln("Data size: ", block.uncompressed_size);
+               // writeln("Data: ", cast(string)block.uncompressed_data[0 .. 80], "...");
                 external_blocks ~= block;
             } else if (block.content_type == CramBlock.ContentType.coreData) {
                 core_data = block.uncompressed_data;
@@ -1036,97 +1067,83 @@ void main(string[] args) {
         }
         
         if (container.n_records > 0) {
-            auto bf_encoding = compression.encoding("BF");
-            auto cf_encoding = compression.encoding("CF");
-            auto ri_encoding = compression.encoding("RI");
-            auto rl_encoding = compression.encoding("RL");
-            auto ap_encoding = compression.encoding("AP");
-            auto rg_encoding = compression.encoding("RG");
-            auto rn_encoding = compression.encoding("RN");
-            auto mf_encoding = compression.encoding("MF");
-            auto ns_encoding = compression.encoding("NS");
-            auto np_encoding = compression.encoding("NP");
-            auto ts_encoding = compression.encoding("TS");
-            auto nf_encoding = compression.encoding("NF");
-            auto tl_encoding = compression.encoding("TL");
-            auto fn_encoding = compression.encoding("FN");
-            auto mq_encoding = compression.encoding("MQ");
-            auto ba_encoding = compression.encoding("BA");
-            auto qs_encoding = compression.encoding("QS");
-
+            auto encodings = CramRecordEncodingPack(compression);
+            auto read_feature_encodings = ReadFeatureEncodingPack(compression);
+            
             auto bit_stream = BitStream(core_data, external_blocks);
             int prev_pos = int.min;
 
             for (size_t i = 0; i < container.n_records; ++i) {
-            auto bit_flags = CramBitFlags(bit_stream.read(bf_encoding));
-            auto compression_flags = CompressionBitFlags(bit_stream.read(cf_encoding));
-            int ref_id = bit_stream.read(ri_encoding);
-            int read_length = bit_stream.read(rl_encoding);
+            auto bit_flags = CramBitFlags(bit_stream.read(encodings.BF));
+            auto compression_flags = CompressionBitFlags(bit_stream.read(encodings.CF));
+            int ref_id = bit_stream.read(encodings.RI);
+            int read_length = bit_stream.read(encodings.RL);
 
             int position;
             if (prev_pos == int.min || !compression.AP_is_delta_encoded)
-                position = bit_stream.read(ap_encoding);
+                position = bit_stream.read(encodings.AP);
             else
-                position = prev_pos + bit_stream.read(ap_encoding);
+                position = prev_pos + bit_stream.read(encodings.AP);
             prev_pos = position;
 
-            int read_group = bit_stream.read(rg_encoding);
+            int read_group = bit_stream.read(encodings.RG);
 
             string read_name;
             if (compression.read_names_included)
-                read_name = cast(string)bit_stream.readArray(rn_encoding);
-            writeln("Read: ", read_name);
-            writeln("  Position: ", position + container.start_pos);
-            writeln("  Read group id: ", read_group);
+                read_name = cast(string)bit_stream.readArray(encodings.RN);
+           // writeln("Read: ", read_name);
+           // writeln("  Position: ", position + container.start_pos);
+           // writeln("  Read group id: ", read_group);
 
             if (compression_flags.detached) {
-                auto mate_flags = MateFlags(bit_stream.read(mf_encoding));
+                auto mate_flags = MateFlags(bit_stream.read(encodings.MF));
                 // logic behind this:
                 // even if we don't include read names in general, for detached mates
                 // they still should be present, since this is the way we find the mate later
                 if (!compression.read_names_included)
-                    read_name = cast(string)bit_stream.readArray(rn_encoding);
-                int mate_ref_id = bit_stream.read(ns_encoding);
-                int mate_position = bit_stream.read(np_encoding);
-                int template_size = bit_stream.read(ts_encoding);
-                writeln("Mate: ", read_name);
-                writeln("  Ref. id: ", mate_ref_id);
-                writeln("  Position: ", mate_position);
-                writeln("  Template size: ", template_size);
+                    read_name = cast(string)bit_stream.readArray(encodings.RN);
+                int mate_ref_id = bit_stream.read(encodings.NS);
+                int mate_position = bit_stream.read(encodings.NP);
+                int template_size = bit_stream.read(encodings.TS);
+               // writeln("Mate: ", read_name);
+               // writeln("  Ref. id: ", mate_ref_id);
+               // writeln("  Position: ", mate_position);
+               // writeln("  Template size: ", template_size);
             } else if (compression_flags.has_mate_downstream) {
-                int records_to_next_fragment = bit_stream.read(nf_encoding);
-                writeln("Records to next fragment: ", records_to_next_fragment);
+                int records_to_next_fragment = bit_stream.read(encodings.NF);
+               // writeln("Records to next fragment: ", records_to_next_fragment);
             }
 
-            int taglist_id = bit_stream.read(tl_encoding);
-            writeln("Tags: ", compression.tags(taglist_id));
-            foreach (tag; compression.tags(taglist_id)) {
-                auto bytes = bit_stream.readArray(compression.tagEncoding(tag));
+            int taglist_id = bit_stream.read(encodings.TL);
+           // writeln("Tags: ", compression.tags(taglist_id));
+            foreach (ref tag; compression.tags(taglist_id)) {
+                auto bytes = bit_stream.readArray(tag.encoding);
                 size_t offset = 0;
-                auto value = bio.bam.tagvalue.readValueFromArray(tag.type, bytes, offset);
-                writeln("[", tag.name, "] = ", value);
+                //auto value = bio.bam.tagvalue.readValueFromArray(tag.type, bytes, offset);
+               // writeln("[", tag.name, "] = ", value);
             }
 
             if (!bit_flags.is_unmapped) {
-                int n_read_features = bit_stream.read(fn_encoding);
-                writeln("  ", n_read_features, " read features");
+                int n_read_features = bit_stream.read(encodings.FN);
+               // writeln("  ", n_read_features, " read features");
                 int feature_prev_pos = 0;
                 foreach (k; 0 .. n_read_features) {
-                    auto feature = ReadFeature.readFromBitStream(bit_stream, compression,
+                    auto feature = ReadFeature.readFromBitStream(bit_stream,
+                                                                 read_feature_encodings,
                                                                  feature_prev_pos);
-                    writeln("    ", feature);
+                   // writeln("    ", feature);
                 }
-                auto mapping_quality = bit_stream.read(mq_encoding);
-                writeln("  Mapping quality = ", mapping_quality);
+                auto mapping_quality = bit_stream.read(encodings.MQ);
+               // writeln("  Mapping quality = ", mapping_quality);
             } else {
                 auto bases = new char[read_length];
                 foreach (k; 0 .. read_length)
-                    bases[k] = cast(char)(bit_stream.read(ba_encoding));
+                    bases[k] = cast(char)(bit_stream.read(encodings.BA));
             }
 
             if (compression_flags.qualities_stored_as_array) {
-                auto qualities = bit_stream.readArray(qs_encoding, read_length); 
-                writeln(qualities.map!(c=>cast(char)(c+33)));
+                auto qualities = bit_stream.readArray(encodings.QS, read_length); 
+               // writeln(qualities.map!(c=>cast(char)(c+33)));
             }
 
             ++records_read;
