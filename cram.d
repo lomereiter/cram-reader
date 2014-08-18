@@ -203,7 +203,27 @@ struct Encoding {
         }
     }
     static struct GolombParams { itf8 offset; itf8 M; }
-    static struct SubExponentialParams { itf8 offset; itf8 k; }
+    static struct SubExponentialParams {
+        itf8 offset; itf8 k; 
+        itf8 read(ref BitStream bitstream) {
+            int result;
+            size_t i;
+            while (bitstream.front) {
+                ++i; // count 1s
+                bitstream.popFront();
+            }
+            bitstream.popFront(); // skip separator
+            size_t n_bits = i == 0 ? k : i + k - 1;
+            foreach (j; 0 .. n_bits) {
+                result <<= 1;
+                result += bitstream.front ? 1 : 0;
+                bitstream.popFront();
+            }
+
+            result += 1 << (i + k - 1);
+            return itf8(result - offset);
+        }
+    }
 
     static struct HuffmanParams {
         itf8[] alphabet; 
@@ -419,6 +439,8 @@ struct BitStream {
                 return encoding.huffman.read(this);
             case EncodingType.gamma:
                 return encoding.gamma.read(this);
+            case EncodingType.subExp:
+                return encoding.sub_exp.read(this);
             case EncodingType.external:
                 auto id = encoding.external.id;
                 auto bytes_read = _read_bytes_from_external[id];
@@ -963,7 +985,7 @@ import std.range, std.algorithm;
 
 void main(string[] args) {
     auto cram = new CramReader(args[1]);
-    foreach (container; cram.containers.take(15)) {
+    foreach (container; cram.containers.take(50)) {
         writeln("=== container ===", " (", container.data.length, " bytes, ", container.n_records, " records)");
         CompressionHeader compression;
         MappedSliceHeader slice_header;
