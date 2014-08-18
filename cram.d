@@ -238,10 +238,7 @@ struct Encoding {
 
     static struct HuffmanParams {
         itf8[] alphabet; 
-        union {
-            itf8[] bitlengths;
-            itf8[] codes;
-        }
+        itf8[] bitlengths;
 
         void buildTree() {
             root = new Node;
@@ -399,24 +396,26 @@ bool read(S)(auto ref S stream, Encoding* encoding) {
 struct BitStream {
     private {
         const(ubyte)[] _data;
-        ubyte _curr_byte_read_bits;
         size_t _read_bytes;
         CramBlock[] _external_blocks;
         size_t[] _read_bytes_from_external;
+        ubyte _curr_mask;
     }
 
     this(const(ubyte)[] data, CramBlock[] external_blocks) {
         _data = data;
-        _curr_byte_read_bits = 0;
+        _curr_mask = 1 << 7;
         _read_bytes = 0;
-        _read_bytes_from_external.length = external_blocks.length;
-        _external_blocks = external_blocks;
+        if (external_blocks !is null) {
+            _read_bytes_from_external.length = external_blocks.length;
+            _external_blocks = external_blocks;
+        }
     }
 
     alias bool bit;
 
     bit front() @property const {
-        return (_data[0] & (1 << (7 - _curr_byte_read_bits))) != 0;
+        return (_data[0] & _curr_mask) != 0;
     }
 
     bool empty() @property const {
@@ -424,16 +423,16 @@ struct BitStream {
     }
 
     void popFront() {
-        ++_curr_byte_read_bits;
-        if (_curr_byte_read_bits == 8) {
+        _curr_mask >>= 1;
+        if (_curr_mask == 0) {
             _data = _data[1 .. $];
-            _curr_byte_read_bits = 0;
+            _curr_mask = 1 << 7;
             ++_read_bytes;
         }
     }
 
-    size_t bits_consumed() @property const {
-        return _curr_byte_read_bits + _read_bytes * 8;
+    size_t bytes_consumed() @property const {
+        return _read_bytes;
     }
 
     itf8 read(Encoding encoding) {
@@ -443,7 +442,7 @@ struct BitStream {
                 itf8 result;
                 .read(bytes, &result);
                 _read_bytes += bytes.ptr - _data.ptr;
-                _curr_byte_read_bits = 0;
+                _curr_mask = 1 << 7;
                 return result;
             case EncodingType.huffmanInt:
                 return encoding.huffman.read(this);
@@ -457,11 +456,10 @@ struct BitStream {
                 auto id = encoding.external.id;
                 auto bytes_read = _read_bytes_from_external[id];
                 auto data = _external_blocks[id].uncompressed_data[bytes_read .. $];
-                auto bitstream = BitStream(data, []);
+                auto bitstream = BitStream(data, null);
                 auto integer = bitstream.read(Encoding(EncodingType.none));
-                auto n_bits = bitstream.bits_consumed;
-                assert(n_bits % 8 == 0);
-                _read_bytes_from_external[id] += n_bits / 8;
+                auto n_bytes = bitstream.bytes_consumed;
+                _read_bytes_from_external[id] += n_bytes;
                 return integer;
             default:
                 stderr.writeln("TODO: implement ", encoding.type);
