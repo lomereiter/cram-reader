@@ -963,7 +963,7 @@ import std.range, std.algorithm;
 
 void main(string[] args) {
     auto cram = new CramReader(args[1]);
-    foreach (container; cram.containers.take(2)) {
+    foreach (container; cram.containers.take(15)) {
         writeln("=== container ===", " (", container.data.length, " bytes, ", container.n_records, " records)");
         CompressionHeader compression;
         MappedSliceHeader slice_header;
@@ -1001,7 +1001,7 @@ void main(string[] args) {
         if (container.n_records > 0) {
             auto bit_stream = BitStream(core_data, external_blocks);
             int prev_pos = int.min;
-            for (size_t i = 0; i < min(10, container.n_records); ++i) {
+            for (size_t i = 0; i < container.n_records; ++i) {
             auto bit_flags = CramBitFlags(bit_stream.read(compression.encoding("BF")));
             auto compression_flags = CompressionBitFlags(bit_stream.read(compression.encoding("CF")));
             int ref_id = bit_stream.read(compression.encoding("RI"));
@@ -1025,13 +1025,15 @@ void main(string[] args) {
 
             if (compression_flags.detached) {
                 auto mate_flags = MateFlags(bit_stream.read(compression.encoding("MF")));
-                string mate_read_name;
-                if (compression.read_names_included)
-                    mate_read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
+                // logic behind this:
+                // even if we don't include read names in general, for detached mates
+                // they still should be present, since this is the way we find the mate later
+                if (!compression.read_names_included)
+                    read_name = cast(string)bit_stream.readArray(compression.encoding("RN"));
                 int mate_ref_id = bit_stream.read(compression.encoding("NS"));
                 int mate_position = bit_stream.read(compression.encoding("NP"));
                 int template_size = bit_stream.read(compression.encoding("TS"));
-                writeln("Mate: ", mate_read_name);
+                writeln("Mate: ", read_name);
                 writeln("  Ref. id: ", mate_ref_id);
                 writeln("  Position: ", mate_position);
                 writeln("  Template size: ", template_size);
