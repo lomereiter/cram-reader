@@ -1,0 +1,10 @@
+[ ] Golomb encoding
+[ ] BZIP2 decoding (does anyone use it?)
+[x] CIGAR string creation
+[x] Bases reconstruction
+[ ] Pairing reads (correct mate flags and template length)
+[ ] MD and NM tags
+[ ] Parallelization
+[ ] MD5 check of references
+[ ] External downloading of reference
+[ ] Random access using index
