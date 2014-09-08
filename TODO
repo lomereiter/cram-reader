@@ -1,3 +1,4 @@
+[ ] Substitution matrix
 [ ] Golomb encoding
 [ ] BZIP2 decoding (does anyone use it?)
 [x] CIGAR string creation
