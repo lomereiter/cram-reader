@@ -1081,6 +1081,8 @@ struct ReadFeature {
 	ReadFeature feature;
 	feature.type = cast(Type)(bitstream.read(encodings.FC));
 	feature.position = bitstream.read(encodings.FP) + prev_pos;
+	if (prev_pos == 0)
+	    feature.position -= 1; // they seem to be 1-based
 	prev_pos = feature.position;
 	final switch (feature.type) {
 	    case Type.readBase:      feature.read_base.read(bitstream, encodings);   break;
@@ -1473,9 +1475,8 @@ struct ReadFeatureBuffer {
 
 	foreach (feature; _read_features) {
 	    foreach (k; pos .. feature.position) {
-		bases.setBase(k, reference[pos]);
+		bases.setBase(k, reference[ref_pos++]);
 	    }
-	    ref_pos += feature.position - pos;
 	    pos = feature.position;
 
 	    final switch (feature.type) {
