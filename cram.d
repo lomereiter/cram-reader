@@ -1411,6 +1411,24 @@ void setBase(ubyte[] bases, size_t k, char base) {
     }
 }
 
+void setBases(T)(ubyte[] dst, size_t offset, T[] src) {
+    if (src.length == 0)
+	return;
+    if (offset % 2 != 0) {
+	dst.setBase(offset, src[0]);
+	src = src[1 .. $];
+	++offset;
+    }
+    size_t real_offset = offset / 2;
+    foreach (k; 0 .. src.length / 2) {
+	auto b1 = Base16(src[2*k]).internal_code;
+	auto b2 = Base16(src[2*k+1]).internal_code;
+	dst[real_offset + k] = cast(ubyte)((b1 << 4) | b2);
+    }
+    if ((src.length & 1) != 0)
+	dst[real_offset + src.length / 2] = cast(ubyte)(Base16(src[$-1]).internal_code << 4);
+}
+
 class FastaReader {
     private FastaSequence[string] _dict;
 
@@ -1445,71 +1463,119 @@ struct FastaSequence {
 
     private MmFile _file;
 
+    private size_t byteNumber(size_t line_number, size_t inner_offset) {
+	return offset + line_number * bytes_per_line + inner_offset;
+    }
+
     char opIndex(size_t pos) {
 	auto line_number = pos / bases_per_line;
 	auto inner_offset = pos % bases_per_line;
-	auto byte_number = offset + line_number * bytes_per_line + inner_offset;
-	return cast(char)_file[byte_number];
+	return cast(char)_file[byteNumber(line_number, inner_offset)];
+    }
+
+    void copySlice(size_t from, size_t to, ubyte* ptr) {
+	auto first_line_number = from / bases_per_line;
+	auto first_inner_offset = from % bases_per_line;
+	auto first_byte_number = byteNumber(first_line_number, first_inner_offset);
+	auto last_line_number = to / bases_per_line;
+	auto last_inner_offset = to % bases_per_line;
+	if (first_line_number == last_line_number) {
+	    auto len = last_inner_offset - first_inner_offset;
+	    ptr[0 .. len] = cast(ubyte[])_file[first_byte_number .. first_byte_number + len];
+	} else {
+	    auto len1 = bases_per_line - first_inner_offset;
+	    ptr[0 .. len1] = cast(ubyte[])_file[first_byte_number .. first_byte_number + len1];
+	    ptr += len1;
+	    foreach (line_num; first_line_number + 1 .. last_line_number) {
+		auto b = byteNumber(line_num, 0);
+		ptr[0 .. bases_per_line] = cast(ubyte[])_file[b .. b + bases_per_line];
+		ptr += bases_per_line;
+	    }
+	    auto len2 = last_inner_offset;
+	    auto b = byteNumber(last_line_number, 0);
+	    ptr[0 .. len2] = cast(ubyte[])_file[b .. b + len2];
+	}
     }
 }
 
 struct ReadFeatureBuffer {
     private {
-	ReadFeature[] _read_features;
+	ReadFeature[] _read_features_buf;
+	ReadFeature[] _read_features() @property { return _read_features_buf[0 .. _curr]; }
 	size_t _curr;
+	ubyte[] _ref_chunk_buf;
     }
 
     FastaSequence reference;
     CompressionHeader* compression;
 
     void reserve(size_t n) {
-	_read_features.length = n;
+	_read_features_buf.length = n;
 	_curr = 0;
     }
 
     void append(ref ReadFeature feature) {
-	assert(_curr < _read_features.length);
-	_read_features[_curr++] = feature;
+	assert(_curr < _read_features_buf.length);
+	_read_features_buf[_curr++] = feature;
     }
 
     void reset() {
 	_curr = 0;
-	_read_features.length = 0;
     }
 
     ubyte[] restoreBases(ubyte[] bases, size_t position, size_t read_length) {
 	int pos = 0;
+
 	long ref_pos = position;
-	if (reference.length < position + read_length) {
-	    auto overlap = reference.length - position;
-	    foreach (k; 0 .. overlap)
-		bases.setBase(k, reference[position + k]);
-	    foreach (k; overlap .. read_length)
-		bases.setBase(k, 'N');
-	} else {
-	    foreach (k; 0 .. read_length)
-		bases.setBase(k, reference[position + k]);
+	long end_ref_pos = ref_pos + read_length;
+	foreach (feature; _read_features) {
+	    if (feature.type == 'I')
+		end_ref_pos -= feature.insertion.bases.length;
+	    else if (feature.type == 'i')
+		end_ref_pos -= 1;
+	    else if (feature.type == 'D')
+		end_ref_pos += feature.deletion.length;
+	    else if (feature.type == 'N')
+		end_ref_pos += feature.ref_skip.length;
+	    else if (feature.type == 'P')
+		end_ref_pos += feature.padding.length;
 	}
 
-	foreach (feature; _read_features) {
-	    foreach (k; pos .. feature.position) {
-		bases.setBase(k, reference[ref_pos++]);
+	end_ref_pos = min(reference.length, end_ref_pos);
+	_ref_chunk_buf.length = max(_ref_chunk_buf.length, end_ref_pos - ref_pos);
+	reference.copySlice(ref_pos, end_ref_pos, _ref_chunk_buf.ptr);
+	auto ref_chunk = _ref_chunk_buf[0 .. end_ref_pos - ref_pos];
+
+	if (_read_features.empty) {
+	    if (reference.length < position + read_length) {
+		auto overlap = reference.length - position;
+		bases.setBases(0, ref_chunk[0 .. overlap]);
+		foreach (k; overlap .. read_length)
+		    bases.setBase(k, 'N');
+	    } else {
+		bases.setBases(0, ref_chunk[0 .. read_length]);
 	    }
+	}
+
+	ref_pos = 0;
+
+	foreach (feature; _read_features) {
+	    bases.setBases(pos, ref_chunk[ref_pos .. ref_pos + feature.position - pos]);
 	    pos = feature.position;
 
 	    final switch (feature.type) {
 	    case 'X':
-		auto b = compression.getSubstitution(reference[ref_pos], feature.subst.code);
+		auto b = compression.getSubstitution(ref_chunk[ref_pos], feature.subst.code);
 		bases.setBase(pos, b);
 		++pos; ++ref_pos;
 		break;
 	    case 'I':
-		foreach (b; feature.insertion.bases)
-		    bases.setBase(pos++, b);
+		bases.setBases(pos, feature.insertion.bases);
+		pos += feature.insertion.bases.length;
 		break;
 	    case 'S':
-		foreach (b; feature.soft_clip.bases)
-		    bases.setBase(pos++, b);
+		bases.setBases(pos, feature.soft_clip.bases);
+		pos += feature.soft_clip.bases.length;
 		break;
 	    case 'H':
 		break;
@@ -1533,8 +1599,7 @@ struct ReadFeatureBuffer {
 	    }
 	}
 
-	while (pos < read_length && ref_pos < reference.length)
-	    bases.setBase(pos++, reference[ref_pos++]);
+	bases.setBases(pos, ref_chunk[ref_pos .. $]);
 
 	return bases[0 .. read_length / 2 + read_length % 2];
     }
@@ -1704,18 +1769,18 @@ final class ContainerBamRecordRange : CramIterator {
 	 FastaReader fasta) {
 	this._reader = reader;
 	this._fasta = fasta;
-	buf.length = 1024 * 1024 * 100;
+	buf = uninitializedArray!(ubyte[])(1024 * 1024 * 100);
 	index.length = 4 * 100000;
 	distances.length = 4 * 100000;
 	names.length = 4 * 100000;
 	next.length = distances.length;
 	prev.length = distances.length;
 
-	tag_data.length = 1024 * 1024;
+	tag_data = uninitializedArray!(ubyte[])(1024 * 1024);
 
-	bases.length = maxReadBufferLength;
-	scores.length = maxReadBufferLength;
-	cigar_buf.length = maxReadBufferLength;
+	bases = uninitializedArray!(ubyte[])(maxReadBufferLength);
+	scores = uninitializedArray!(ubyte[])(maxReadBufferLength);
+	cigar_buf = uninitializedArray!(CigarOperation[])(maxReadBufferLength);
 
 	read_groups.length = header.read_groups.length;
 	size_t i;
@@ -1924,6 +1989,9 @@ final class ContainerBamRecordRange : CramIterator {
 	buf[start + tagsOffset .. $][0 .. tag_data_len] = tag_data[0 .. tag_data_len];
 	endOffset += tag_data_len;
 
+	// FIXME: this is temporary
+	setMateReferenceId(-1);
+
 	writeFlags();
 
 	_front.raw_data = buf[start + refIdOffset .. start + endOffset];
@@ -1951,11 +2019,15 @@ void main(string[] args) {
     size_t records_read;
     // scope(exit) stderr.writeln(records_read);
     int asdf = 1;
+    auto writer = stdout.lockingTextWriter;
+    import std.format;
+    FormatSpec!char fmt;
+    fmt.spec = 's';
     foreach (record; cram.bam_reads) {
 	++records_read;
-	writefln("%s", record);
+	record.toString((const(char)[] x) { writer.put(x); writer.put("\n"); }, fmt);
 	if (records_read >= asdf * 1_000_000) {
-	    writeln("Records read: ", records_read, ", time: ", sw.peek().msecs, " ms");
+	    stderr.writeln("Records read: ", records_read, ", time: ", sw.peek().msecs, " ms");
 	    ++asdf;
 	}
     }
