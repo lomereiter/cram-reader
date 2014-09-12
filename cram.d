@@ -537,8 +537,12 @@ struct CompressionHeader {
 	    ubyte[] td;
 	    size_t[] starts;
 
+	    char[4][5] bases;
+
 	    char subst(char ref_base, ubyte code) {
-		return ref_base; // FIXME
+		assert(code < 4);
+		auto ref_base_code = Base5(ref_base).internal_code;
+		return bases[ref_base_code][code];
 	    }
 	}
 
@@ -574,6 +578,17 @@ struct CompressionHeader {
 		    break;
 		}
 		default: assert(0);
+		}
+	    }
+
+	    foreach (ref_base_code; 0 .. 5) {
+		ubyte bc;
+		foreach (k; 1 .. 5) {
+		    if (bc == ref_base_code)
+			++bc;
+		    auto code = (_pm.sm[ref_base_code] >> (8 - 2 * k)) & 3;
+		    _pm.bases[ref_base_code][code] = Base5.fromInternalCode(bc).asCharacter;
+		    ++bc;
 		}
 	    }
 	    return true;
@@ -1080,9 +1095,12 @@ struct ReadFeature {
     {
 	ReadFeature feature;
 	feature.type = cast(Type)(bitstream.read(encodings.FC));
-	feature.position = bitstream.read(encodings.FP) + prev_pos;
-	if (prev_pos == 0)
-	    feature.position -= 1; // they seem to be 1-based
+	if (prev_pos == -1) {
+	    // first position is 1-based;
+	    feature.position = bitstream.read(encodings.FP) - 1;
+	} else {
+	    feature.position = bitstream.read(encodings.FP) + prev_pos;
+	}
 	prev_pos = feature.position;
 	final switch (feature.type) {
 	    case Type.readBase:      feature.read_base.read(bitstream, encodings);   break;
@@ -1260,7 +1278,7 @@ abstract class CramIterator {
 
 	if (!bit_flags.is_unmapped) {
 	    int n_read_features = bit_stream.read(encodings.FN);
-	    int feature_prev_pos = 0;
+	    int feature_prev_pos = -1;
 	    setNumberOfFeatures(n_read_features);
 	    foreach (k; 0 .. n_read_features)
 		setFeature(k, ReadFeature.readFromBitStream(bit_stream,
@@ -1535,9 +1553,8 @@ struct ReadFeatureBuffer {
     }
 
     CigarOperation[] restoreCigar(CigarOperation[] cigar, size_t read_length) {
-	int total_op_len = 1;
 	int last_op_len = 0;
-	int last_op_pos = 1;
+	int last_op_pos = 0;
 	int n_cigar_op = 0;
 	char last_type = 'M';
 	char co;
@@ -1548,7 +1565,6 @@ struct ReadFeatureBuffer {
 		if (last_type != 'M') {
 		    cigar[n_cigar_op++] = CigarOperation(last_op_len, last_type);
 		    last_op_pos += last_op_len;
-		    total_op_len += last_op_len;
 		    last_op_len = gap;
 		} else {
 		    last_op_len += gap;
@@ -1574,7 +1590,6 @@ struct ReadFeatureBuffer {
 	    if (last_type != co) {
 		if (last_op_len > 0) {
 		    cigar[n_cigar_op++] = CigarOperation(last_op_len, last_type);
-		    total_op_len += last_op_len;
 		}
 		last_type = co;
 		last_op_len = len;
@@ -1583,18 +1598,18 @@ struct ReadFeatureBuffer {
 		last_op_len += len;
 	    }
 
-	    if (!CigarOperation(0, co).is_query_consuming)
+	    if (!CigarOperation(len, co).is_query_consuming)
 		last_op_pos -= len;
 	}
 
 	if (last_type != 'M') {
 	    cigar[n_cigar_op++] = CigarOperation(last_op_len, last_type);
-	    if (read_length >= last_op_pos + last_op_len) {
-		auto len = read_length - (last_op_len + last_op_pos) + 1;
+	    if (read_length > last_op_pos + last_op_len) {
+		auto len = read_length - (last_op_len + last_op_pos);
 		cigar[n_cigar_op++] = CigarOperation(cast(uint)len, 'M');
 	    }
-	} else if (read_length > last_op_pos - 1) {
-	    auto len = read_length - last_op_pos + 1;
+	} else if (read_length > last_op_pos) {
+	    auto len = read_length - last_op_pos;
 	    cigar[n_cigar_op++] = CigarOperation(cast(uint)len, 'M');
 	}
 
