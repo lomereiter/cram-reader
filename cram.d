@@ -527,7 +527,7 @@ struct TagDefinition {
     }
 }
 
-struct CompressionHeader {
+final class CompressionHeader {
     private {
 	static struct PreservationMap {
 	    ubyte rn;
@@ -639,6 +639,9 @@ struct CompressionHeader {
 	}
     }
 
+    CramRecordEncodingPack encodings;
+    ReadFeatureEncodingPack read_feature_encodings;
+
     bool read_names_included() @property const { return !!_pm.rn; }
     bool AP_is_delta_encoded() @property const { return !!_pm.ap; }
     bool reference_required() @property const { return !!_pm.rr; }
@@ -663,10 +666,13 @@ struct CompressionHeader {
 	bool ok = readPreservationMap(data); assert(ok);
 	ok = readDataSeriesEncodings(data); assert(ok);
 	ok = readTagEncodings(data); assert(ok);
+
+	encodings = CramRecordEncodingPack(this);
+	read_feature_encodings = ReadFeatureEncodingPack(this);
     }
 }
 
-struct MappedSliceHeader {
+final class MappedSliceHeader {
     private {
 	itf8 _ref_id;
 	itf8 _start_pos;
@@ -777,6 +783,29 @@ struct CramContainer {
 
     CramBlockRange blocks() const {
 	return typeof(return)(data, n_blocks);
+    }
+
+    private CramSlice[] _slices;
+    CramSlice[] slices() {
+	if (_slices.length > 0)
+	    return _slices;
+
+	CompressionHeader compression;
+
+	foreach(block; blocks) {
+	    if (block.content_type == CramBlock.ContentType.compressionHeader) {
+		compression = new CompressionHeader(block);
+	    } else if (block.content_type == CramBlock.ContentType.mappedSliceHeader) {
+		_slices.length += 1;
+		_slices.back.compression = compression;
+		_slices.back.header = new MappedSliceHeader(block);
+	    } else if (block.content_type == CramBlock.ContentType.externalData) {
+		_slices.back.external_blocks ~= block;
+	    } else if (block.content_type == CramBlock.ContentType.coreData) {
+		_slices.back.core_data = block.uncompressed_data;
+	    }
+	}
+	return _slices;
     }
 }
 
@@ -978,7 +1007,7 @@ struct EncodingPack(encodings...) {
 	}
 
 	static string constructor(encodings...)() {
-	    string result = "this(ref CompressionHeader compression) {";
+	    string result = "this(CompressionHeader compression) {";
 	    foreach (enc; encodings) {
 		result ~= enc~`=compression.encoding("`~enc~`");`;
 	    }
@@ -1020,7 +1049,7 @@ struct ReadFeature {
 
 	static string reader(specs...)() {
 	    string result = "void read(ref BitStream bitstream, "
-			    "ref ReadFeatureEncodingPack encodings) {";
+			    "ReadFeatureEncodingPack* encodings) {";
 	    foreach (spec; specs) {
 		result ~= spec.Name~`=cast(`~spec.Type.stringof ~`)`;
 		if (isIntegral!(spec.Type) || is(spec.Type == char))
@@ -1090,7 +1119,7 @@ struct ReadFeature {
     }
 
     static ReadFeature readFromBitStream(ref BitStream bitstream,
-					 ref ReadFeatureEncodingPack encodings,
+					 ReadFeatureEncodingPack* encodings,
 					 ref int prev_pos)
     {
 	ReadFeature feature;
@@ -1155,6 +1184,13 @@ struct CramRecord {
     const(ubyte)[] qualities;
 }
 
+struct CramSlice {
+    CompressionHeader compression;
+    MappedSliceHeader header;
+    const(ubyte)[] core_data;
+    CramBlock[] external_blocks;
+}
+
 abstract class CramIterator {
     protected {
 	CompressionHeader compression;
@@ -1168,35 +1204,28 @@ abstract class CramIterator {
 
 	size_t current_record_index;
 	size_t n_records;
-	CramRecordEncodingPack encodings;
-	ReadFeatureEncodingPack read_feature_encodings;
+	CramRecordEncodingPack* encodings;
+	ReadFeatureEncodingPack* read_feature_encodings;
 	BitStream bit_stream;
 	int prev_pos;
     }
 
-    this(ref CramContainer container, SamHeader header) {
+    this(CramSlice slice, SamHeader header) {
 	_header = header;
-	foreach(block; container.blocks) {
-	    if (block.content_type == CramBlock.ContentType.compressionHeader) {
-		compression = CompressionHeader(block);
-	    } else if (block.content_type == CramBlock.ContentType.mappedSliceHeader) {
-		slice_header = MappedSliceHeader(block);
-	    } else if (block.content_type == CramBlock.ContentType.externalData) {
-		external_blocks ~= block;
-	    } else if (block.content_type == CramBlock.ContentType.coreData) {
-		core_data = block.uncompressed_data;
-	    }
-	}
+	compression = slice.compression;
+	slice_header = slice.header;
+	core_data = slice.core_data;;
+	external_blocks = slice.external_blocks;
 
 	onInitializeHeaderBlocks();
 
-	n_records = container.n_records;
+	n_records = slice_header.n_records;
 	if (n_records > 0) {
-	    encodings = CramRecordEncodingPack(compression);
-	    read_feature_encodings = ReadFeatureEncodingPack(compression);
+	    encodings = &compression.encodings;
+	    read_feature_encodings = &compression.read_feature_encodings;
 
 	    bit_stream = BitStream(core_data, external_blocks);
-	    prev_pos = container.start_pos;
+	    prev_pos = cast(int)slice_header.start_pos;
 
 	    fetchNextRecord();
 	}
@@ -1301,13 +1330,13 @@ abstract class CramIterator {
     }
 }
 
-final class ContainerCramRecordRange : CramIterator {
+final class SliceCramRecordRange : CramIterator {
     private {
 	CramRecord _front;
     }
 
-    this(ref CramContainer container, SamHeader header) {
-	super(container, header);
+    this(CramSlice slice, SamHeader header) {
+	super(slice, header);
     }
 
     override void finish() {}
@@ -1396,8 +1425,12 @@ final class ContainerCramRecordRange : CramIterator {
     }
 }
 
-ContainerCramRecordRange cramRecords(ref CramContainer container, SamHeader header) {
-    return new typeof(return)(container, header);
+SliceCramRecordRange cramRecords(CramSlice slice, SamHeader header) {
+    return new typeof(return)(slice, header);
+}
+
+auto cramRecords(ref CramContainer container, SamHeader header) {
+    return container.slices.map!(s => cramRecords(s, header)).joiner();
 }
 
 void setBase(ubyte[] bases, size_t k, char base) {
@@ -1687,7 +1720,7 @@ struct ReadFeatureBuffer {
     }
 }
 
-final class ContainerBamRecordRange : CramIterator {
+final class SliceBamRecordRange : CramIterator {
     // based on net.sf.cram.encoding.reader.ReaderToBam   and
     //          net.sf.cram.encoding.reader.BAMRecordView from CramTools
     private {
@@ -1765,7 +1798,7 @@ final class ContainerBamRecordRange : CramIterator {
 	return _front;
     }
 
-    this(ref CramContainer container, SamHeader header, CramReader reader,
+    this(CramSlice slice, SamHeader header, CramReader reader,
 	 FastaReader fasta) {
 	this._reader = reader;
 	this._fasta = fasta;
@@ -1791,7 +1824,7 @@ final class ContainerBamRecordRange : CramIterator {
 	    ++i;
 	}
 
-	super(container, header);
+	super(slice, header);
     }
 
     override void onInitializeHeaderBlocks() {
@@ -2005,10 +2038,15 @@ final class ContainerBamRecordRange : CramIterator {
     }
 }
 
-ContainerBamRecordRange bamRecords(ref CramContainer container, SamHeader header,
-				   CramReader reader, FastaReader fasta)
+auto bamRecords(CramSlice slice, SamHeader header,
+		     CramReader reader, FastaReader fasta)
 {
-    return new typeof(return)(container, header, reader, fasta);
+    return new SliceBamRecordRange(slice, header, reader, fasta);
+}
+
+auto bamRecords(ref CramContainer container, SamHeader header,
+		CramReader reader, FastaReader fasta) {
+    return container.slices.map!(s => bamRecords(s, header, reader, fasta)).joiner();
 }
 
 void main(string[] args) {
