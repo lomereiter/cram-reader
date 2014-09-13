@@ -1594,6 +1594,7 @@ struct ReadFeatureBuffer {
 
 	foreach (feature; _read_features) {
 	    bases.setBases(pos, ref_chunk[ref_pos .. ref_pos + feature.position - pos]);
+	    ref_pos += feature.position - pos;
 	    pos = feature.position;
 
 	    final switch (feature.type) {
